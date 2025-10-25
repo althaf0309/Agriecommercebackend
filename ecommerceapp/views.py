@@ -340,6 +340,8 @@ class EmailAuthTokenSerializer(serializers.Serializer):
         return attrs
 
 class EmailObtainAuthToken(ObtainAuthToken):
+    authentication_classes = []          # <- CSRF-free (no SessionAuthentication)
+    permission_classes = [AllowAny] 
     serializer_class = EmailAuthTokenSerializer
     def post(self, request, *args, **kwargs):
         ser = self.serializer_class(data=request.data, context={"request": request})
@@ -629,11 +631,10 @@ class ProductViewSet(viewsets.ModelViewSet):
         .prefetch_related("images", "variants", "options", "specifications")
         .all()
     )
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "slug", "description", "category__name"]
     ordering_fields = ["created_at", "name", "price_inr", "price_usd"]
     filterset_fields = ["featured", "category", "category__slug", "is_published", "slug"]
-    # allow JSON + form + multipart
     parser_classes = [JSONParser, FormParser, MultiPartParser]
 
     def get_permissions(self):
@@ -644,13 +645,11 @@ class ProductViewSet(viewsets.ModelViewSet):
     def get_serializer_context(self):
         ctx = super().get_serializer_context()
         ctx["country_code"] = _country_code(self.request)
-        # ensure nested serializers (images/variants) can build absolute URLs
         ctx["request"] = self.request
         return ctx
-    
 
     def get_serializer_class(self):
-        return ProductCreateUpdateSerializer if self.action in ["create","update","partial_update","bulk_upload_images"] else ProductReadSerializer
+        return ProductCreateUpdateSerializer if self.action in ["create", "update", "partial_update", "bulk_upload_images"] else ProductReadSerializer
 
     def perform_create(self, serializer):
         vendor = None
@@ -677,7 +676,6 @@ class ProductViewSet(viewsets.ModelViewSet):
           images_meta: JSON list [{filename, is_primary}]
         """
         product = self.get_object()
-        # FIX: use the actual serializer name you have (no V2 class exists by that name)
         ser = ProductCreateUpdateSerializer(
             instance=product,
             data={},
@@ -714,38 +712,45 @@ class ProductViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], permission_classes=[IsAdminOrVendorOwner])
     def upsert_variants(self, request, pk=None):
         """
-        Payload: { "variants": [ {sku, weight_value, weight_unit, price, stock, is_active, mrp} ] }
-        - price -> price_override
-        - stock -> quantity
-        - if sku exists -> update, else create
+        Upsert with de-duplication:
+        1) Prefer matching by (weight_value, weight_unit) if provided.
+        2) Otherwise match by SKU.
+        3) If creating, auto-generate a unique SKU from product.slug + weight (e.g. "slug-500g").
+        Payload: { "variants": [ {sku?, weight_value?, weight_unit?, price, stock, is_active, mrp, min_order_qty?, step_qty?} ] }
         """
         product = self.get_object()
         items = request.data.get("variants") or []
         if not isinstance(items, list):
             return Response({"detail": "variants must be a list"}, status=400)
 
+        def _dec(x, default=None):
+            if x in (None, "", "null"):
+                return default
+            try:
+                return Decimal(str(x))
+            except Exception:
+                return default
+
+        def _unique_sku(base: str) -> str:
+            base = (base or "").strip() or f"{product.slug}-var"
+            candidate = base
+            i = 2
+            while ProductVariant.objects.filter(product=product, sku=candidate).exists():
+                candidate = f"{base}-{i}"
+                i += 1
+            return candidate
+
         out = []
         for v in items:
-            sku = (v.get("sku") or "").strip()
-            if not sku:
-                w = str(v.get("weight_value") or "").strip()
-                u = str(v.get("weight_unit") or "").strip().upper()
-                if not (w and u):
-                    return Response({"detail": "sku or (weight_value, weight_unit) required"}, status=400)
-                sku = f"{product.slug}-{w}{u.lower()}"
+            raw_sku = (v.get("sku") or "").strip()
+            wv = _dec(v.get("weight_value"))
+            wu = (v.get("weight_unit") or "").strip().upper() or None
 
-            def _dec(x, default=None):
-                if x in (None, "", "null"):
-                    return default
-                try:
-                    return Decimal(str(x))
-                except Exception:
-                    return default
-
+            # Prepare defaults
             defaults = dict(
-                attributes={"Weight": f'{v.get("weight_value")}{(v.get("weight_unit") or "").upper()}'},
-                weight_value=_dec(v.get("weight_value")),
-                weight_unit=(v.get("weight_unit") or "").upper() or None,
+                attributes=v.get("attributes") or ({"Weight": f"{v.get('weight_value')}{(v.get('weight_unit') or '').upper()}"} if (wv is not None and wu) else {}),
+                weight_value=wv,
+                weight_unit=wu,
                 price_override=_dec(v.get("price"), None),
                 quantity=int(v.get("stock") or 0),
                 is_active=bool(v.get("is_active", True)),
@@ -754,10 +759,47 @@ class ProductViewSet(viewsets.ModelViewSet):
                 step_qty=int(v.get("step_qty") or 1),
             )
 
-            obj, created = ProductVariant.objects.update_or_create(
-                product=product, sku=sku, defaults=defaults
-            )
-            out.append(obj)
+            variant = None
+
+            # 1) Try match by weight combo (if provided)
+            if (wv is not None) and wu:
+                variant = ProductVariant.objects.filter(
+                    product=product, weight_value=wv, weight_unit=wu
+                ).first()
+
+            # 2) Else try match by SKU
+            if variant is None and raw_sku:
+                variant = ProductVariant.objects.filter(product=product, sku=raw_sku).first()
+
+            # 3) Create if none found
+            if variant is None:
+                # Derive or ensure unique SKU
+                if raw_sku:
+                    sku_final = _unique_sku(raw_sku)
+                elif (wv is not None) and wu:
+                    base_sku = f"{product.slug}-{str(wv).rstrip('0').rstrip('.') if '.' in str(wv) else str(wv)}{wu.lower()}"
+                    sku_final = _unique_sku(base_sku)
+                else:
+                    sku_final = _unique_sku(f"{product.slug}-var")
+
+                variant = ProductVariant.objects.create(product=product, sku=sku_final, **defaults)
+                out.append(variant)
+                continue
+
+            # 4) Update existing (and optionally move SKU if provided)
+            if raw_sku:
+                if variant.sku != raw_sku:
+                    # If another row already has raw_sku, pick a unique one for *this* variant
+                    if ProductVariant.objects.filter(product=product, sku=raw_sku).exclude(pk=variant.pk).exists():
+                        # keep current variant.sku (no clash) – or you can assign a unique derived one:
+                        pass
+                    else:
+                        variant.sku = raw_sku  # free to use
+            # apply field updates
+            for k, val in defaults.items():
+                setattr(variant, k, val)
+            variant.save()
+            out.append(variant)
 
         ser = ProductVariantSerializer(out, many=True, context=self.get_serializer_context())
         return Response({"ok": True, "count": len(out), "variants": ser.data}, status=200)
@@ -1006,13 +1048,24 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = self._base_queryset()
-        mine = self.request.query_params.get("mine", "1")
-        if mine != "0" or not self.request.user.is_staff:
-            qs = qs.filter(user=self.request.user)
-        return qs
+        user = self.request.user
 
-    # helpers: _get_or_create_guest_user / _ensure_cart / _clean_int / _upsert_cart_items_from_lines
-    # (use your existing versions from the previous message—omitted here for brevity)
+        # Normalize ?mine flag
+        mine_raw = str(self.request.query_params.get("mine", "")).strip().lower()
+        mine = mine_raw in ("1", "true", "yes")
+
+        # Own orders explicitly
+        if mine:
+            return qs.filter(user=user)
+
+        # Staff sees all
+        if user.is_authenticated and (user.is_staff or user.is_superuser):
+            return qs
+
+        # Normal users see only theirs
+        return qs.filter(user=user)
+
+    # ---------- helpers ----------
     def _get_or_create_guest_user(self, data: dict) -> "User":
         email = (data.get("email") or "").strip().lower()
         first = (data.get("firstName") or "").strip()
@@ -1023,6 +1076,7 @@ class OrderViewSet(viewsets.ModelViewSet):
             validate_email(email)
         except DjangoValidationError:
             raise ValidationError("Invalid email")
+
         user, created = User.objects.get_or_create(
             email=email, defaults={"first_name": first, "last_name": last, "is_active": True}
         )
@@ -1031,10 +1085,8 @@ class OrderViewSet(viewsets.ModelViewSet):
             user.save(update_fields=["password", "first_name", "last_name"])
         else:
             updates = {}
-            if first and not user.first_name:
-                updates["first_name"] = first
-            if last and not user.last_name:
-                updates["last_name"] = last
+            if first and not user.first_name: updates["first_name"] = first
+            if last and not user.last_name:   updates["last_name"]  = last
             if updates:
                 for k, v in updates.items():
                     setattr(user, k, v)
@@ -1083,23 +1135,82 @@ class OrderViewSet(viewsets.ModelViewSet):
                 else:
                     obj.delete()
 
-    # --------- CREATE / CONFIRM HOOKS + EMAILS ----------
+    # ---------- CREATE / EMAIL ----------
     def perform_create(self, serializer):
-        order = serializer.save(user=self.request.user, status="pending")
+        order = serializer.save(
+            user=self.request.user,
+            status="pending",
+            shipment_status="pending",
+        )
         if getattr(order, "cart", None):
             order.cart.checked_out = True
             order.cart.save(update_fields=["checked_out"])
-        # email receipts
         send_order_emails(order, self.request)
 
+    # ---------- CONFIRM ----------
     @action(detail=True, methods=["post"])
+    @transaction.atomic
     def confirm(self, request, pk=None):
         order = self.get_object()
-        order.confirm_and_decrement_stock()
-        # send update emails (optional): here we re-send as confirmation
-        send_order_emails(order, request)
-        return Response({"status": order.status})
 
+        # 1) Confirm order + decrement stock, but never crash API
+        try:
+            if hasattr(order, "confirm_and_decrement_stock"):
+                order.confirm_and_decrement_stock()
+            else:
+                # Fallback: just mark confirmed if method not present
+                if order.status != "confirmed":
+                    order.status = "confirmed"
+                    order.save(update_fields=["status"])
+        except Exception as e:
+            # If stock op fails, still move to confirmed? choose policy:
+            # Here we confirm but log & notify admin, and continue.
+            order.status = "confirmed"
+            order.save(update_fields=["status"])
+            try:
+                _send_email(
+                    f"[Admin] Order #{order.id} confirm_and_decrement_stock() failed",
+                    _admin_recipients(),
+                    f"Exception: {e}",
+                    None,
+                )
+            except Exception:
+                pass
+
+        # 2) Mark COD payments as paid (robust payment lookup)
+        pay = getattr(order, "payment", None)
+        if not pay:
+            pay = (
+                OrderPayment.objects.filter(order=order)
+                .order_by("-created_at")
+                .first()
+            )
+
+        def _lower(x): return (str(x or "")).strip().lower()
+
+        is_cod = False
+        if pay:
+            is_cod = (
+                _lower(pay.method) == "cash-on-delivery"
+                or _lower(pay.provider) in ("cod", "cash-on-delivery")
+            )
+        else:
+            is_cod = _lower(order.payment_method) in ("cash-on-delivery", "cod")
+
+        if pay and is_cod and _lower(pay.status) != "paid":
+            pay.status = "paid"
+            pay.save(update_fields=["status"])
+
+        # 3) Send emails (best-effort)
+        try:
+            send_order_emails(order, request)
+        except Exception:
+            pass
+
+        ser = self.get_serializer(order)
+        return Response(ser.data, status=200)
+
+    # ---------- COD ----------
     @action(detail=False, methods=["post"], permission_classes=[permissions.AllowAny])
     @transaction.atomic
     def cod(self, request):
@@ -1110,7 +1221,7 @@ class OrderViewSet(viewsets.ModelViewSet):
         self._upsert_cart_items_from_lines(cart, client_lines)
 
         order = Order.objects.create(
-            user=user, cart=cart, status="pending",
+            user=user, cart=cart, status="pending", shipment_status="pending",
             payment_method="cash-on-delivery", country_code="IN", currency="INR",
         )
 
@@ -1132,7 +1243,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
         totals = data.get("totals") or {}
         OrderPayment.objects.create(
-            order=order, method="cash-on-delivery", provider="", status="pending",
+            order=order, method="cash-on-delivery", provider="cod", status="pending",
             transaction_id="", currency="INR",
             amount=Decimal(str(totals.get("grand_total") or totals.get("total") or 0)),
             raw={"lines": client_lines, "totals": totals},
@@ -1141,12 +1252,15 @@ class OrderViewSet(viewsets.ModelViewSet):
         cart.checked_out = True
         cart.save(update_fields=["checked_out"])
 
-        # emails
-        send_order_emails(order, request)
+        try:
+            send_order_emails(order, request)
+        except Exception:
+            pass
 
         ser = self.get_serializer(order)
         return Response({"ok": True, "order": ser.data}, status=201)
 
+    # ---------- Razorpay ----------
     @action(detail=False, methods=["post"], permission_classes=[permissions.AllowAny])
     @transaction.atomic
     def razorpay_confirm(self, request):
@@ -1162,7 +1276,7 @@ class OrderViewSet(viewsets.ModelViewSet):
         self._upsert_cart_items_from_lines(cart, client_lines)
 
         order = Order.objects.create(
-            user=user, cart=cart, status="confirmed",
+            user=user, cart=cart, status="confirmed", shipment_status="pending",
             payment_method="card", country_code="IN", currency="INR",
         )
 
@@ -1193,12 +1307,17 @@ class OrderViewSet(viewsets.ModelViewSet):
         cart.checked_out = True
         cart.save(update_fields=["checked_out"])
 
+        # Try stock decrement, but never 500
         try:
-            order.confirm_and_decrement_stock()
+            if hasattr(order, "confirm_and_decrement_stock"):
+                order.confirm_and_decrement_stock()
+            else:
+                if order.status != "confirmed":
+                    order.status = "confirmed"
+                    order.save(update_fields=["status"])
         except Exception as e:
             order.status = "pending"
             order.save(update_fields=["status"])
-            # still send an admin alert about failure?
             try:
                 _send_email(
                     f"[Admin] Order #{order.id} stock confirmation failed",
@@ -1210,11 +1329,49 @@ class OrderViewSet(viewsets.ModelViewSet):
                 pass
             return Response({"ok": False, "order_id": order.id, "detail": str(e)}, status=409)
 
-        # emails
-        send_order_emails(order, request)
+        try:
+            send_order_emails(order, request)
+        except Exception:
+            pass
 
         ser = self.get_serializer(order)
         return Response({"ok": True, "order": ser.data}, status=201)
+
+    # ---------- shipment quick update ----------
+    def partial_update(self, request, *args, **kwargs):
+        if not request.user.is_staff:
+            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        data = request.data or {}
+        if "shipment_status" not in data:
+            return super().partial_update(request, *args, **kwargs)
+
+        val = str(data["shipment_status"])
+        valid = dict(Order.SHIPMENT_STATUS_CHOICES)
+        if val not in valid:
+            return Response({"detail": "Invalid shipment_status"}, status=status.HTTP_400_BAD_REQUEST)
+
+        order = self.get_object()
+        if order.shipment_status != val:
+            order.shipment_status = val
+            order.save(update_fields=["shipment_status"])
+
+        ser = self.get_serializer(order)
+        return Response(ser.data, status=200)
+
+    @action(detail=True, methods=["post"])
+    def set_shipment(self, request, pk=None):
+        if not request.user.is_staff:
+            return Response({"detail": "Forbidden"}, status=403)
+        val = str((request.data or {}).get("shipment_status") or "")
+        valid = dict(Order.SHIPMENT_STATUS_CHOICES)
+        if val not in valid:
+            return Response({"detail": "Invalid shipment_status"}, status=400)
+        order = self.get_object()
+        order.shipment_status = val
+        order.save(update_fields=["shipment_status"])
+        return Response({"id": order.id, "shipment_status": order.shipment_status})
+
 # ---------- Payments: Razorpay ----------
 class RazorpayPaymentViewSet(viewsets.ViewSet):
     permission_classes = [AllowAny]

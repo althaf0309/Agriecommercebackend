@@ -2,7 +2,8 @@ from pathlib import Path
 from io import BytesIO
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta
-
+from django.core.exceptions import ValidationError
+from django.db.models.functions import Lower
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.db import models, transaction
@@ -484,7 +485,50 @@ class ProductVariant(TimeStampedMixin):
     step_qty      = models.PositiveIntegerField(default=1)
 
     class Meta:
-        indexes = [models.Index(fields=["product", "is_active"]), models.Index(fields=["weight_unit"])]
+        indexes = [
+            models.Index(fields=["product", "is_active"]),
+            models.Index(fields=["weight_unit"]),
+        ]
+        # ✅ stop duplicate weight variants per product (case-insensitive unit)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["product", "weight_value", "weight_unit"],
+                name="uq_variant_product_weight",
+                condition=models.Q(weight_value__isnull=False, weight_unit__isnull=False),
+            )
+        ]
+
+    def clean(self):
+        # normalize casing and basic consistency
+        if self.weight_unit:
+            self.weight_unit = str(self.weight_unit).upper()
+        if self.weight_unit and self.weight_value is None:
+            raise ValidationError("weight_value is required when weight_unit is set.")
+
+        # prevent duplicate (product, weight_value, weight_unit)
+        if (
+            self.product_id
+            and self.weight_value is not None
+            and self.weight_unit
+        ):
+            clash = ProductVariant.objects.filter(
+                product_id=self.product_id,
+                weight_value=self.weight_value,
+                weight_unit=self.weight_unit,
+            )
+            if self.pk:
+                clash = clash.exclude(pk=self.pk)
+            if clash.exists():
+                raise ValidationError("A variant with this weight already exists for this product.")
+
+    def save(self, *args, **kwargs):
+        # ensure normalized before persistence
+        if self.weight_unit:
+            self.weight_unit = str(self.weight_unit).upper()
+        if self.sku:
+            self.sku = self.sku.strip()
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
     def unit_price_for_country(self, country_code: str) -> Decimal:
         base = self.price_override if self.price_override is not None else self.product.base_price_for_country(country_code)
@@ -570,15 +614,40 @@ class CartItem(TimeStampedMixin):
             label += f" [{self.variant.attributes}]"
         return label
 
+from decimal import Decimal
+from django.db import models, transaction
+from django.db.models import F
+
+# ...other imports...
+# from .models import Product, ProductVariant, Vendor, Cart, CartItem, User
+
 class Order(TimeStampedMixin):
+    STATUS_CHOICES = (
+        ("pending", "Pending"),
+        ("confirmed", "Confirmed"),
+        ("cancelled", "Cancelled"),
+    )
+
+    # NEW: shipment workflow separate from payment/order status
+    SHIPMENT_STATUS_CHOICES = (
+        ("placed", "Placed"),
+        ("pending", "Pending"),
+        ("processing", "Processing"),
+        ("delivered", "Delivered"),
+    )
+
     user   = models.ForeignKey(User, related_name="orders", on_delete=models.CASCADE)
     cart   = models.OneToOneField(Cart, on_delete=models.PROTECT)
-    status = models.CharField(
-        max_length=20,
-        choices=[("pending","Pending"),("confirmed","Confirmed"),("cancelled","Cancelled")],
-        default="pending"
-    )
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
     payment_method = models.CharField(max_length=30, blank=True)
+
+    # NEW: shipment status (admin can change without touching payment/order status)
+    shipment_status = models.CharField(
+        max_length=20,
+        choices=SHIPMENT_STATUS_CHOICES,
+        default="pending",
+    )
 
     # Pricing context
     country_code = models.CharField(max_length=2, default="IN")
@@ -625,6 +694,7 @@ class Order(TimeStampedMixin):
                 total_units_sold=F("total_units_sold") + q,
                 total_revenue=F("total_revenue") + vendor_sales.get(vid, Decimal("0"))
             )
+
 
 # ─────── Visits / Contact ───────
 class VisitEvent(TimeStampedMixin):

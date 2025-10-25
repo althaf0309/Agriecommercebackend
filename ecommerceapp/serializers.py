@@ -4,7 +4,9 @@ from typing import Any, Optional, List, Dict
 import json
 from django.db import transaction
 from rest_framework import serializers
-
+from django.utils.text import slugify
+from django.utils import timezone
+from dateutil import parser as dateparser
 from .models import *
 
 # ---------- Helpers ----------
@@ -13,7 +15,18 @@ class IDRelatedField(serializers.PrimaryKeyRelatedField):
     """Accept raw integer id (or null) for FK fields, expose as *_id."""
     def to_representation(self, value):
         return value.pk if value else None
-
+def _user_display_name(u):
+    if not u:
+        return None
+    first = (getattr(u, "first_name", "") or "").strip()
+    last  = (getattr(u, "last_name", "") or "").strip()
+    if first or last:
+        return f"{first} {last}".strip()
+    username = (getattr(u, "username", "") or "").strip()
+    if username:
+        return username
+    email = (getattr(u, "email", "") or "").strip()
+    return email.split("@")[0] if email else None
 
 def _to_decimal(val: Any, default: str = "0.00", allow_none: bool = False) -> Optional[Decimal]:
     if val in (None, "", "null"):
@@ -68,7 +81,24 @@ def _absolute_media_url(request, path_or_file):
         return urljoin(base, url.lstrip("/"))
     return urljoin(base, (media_prefix + url).lstrip("/"))
 
+def _render_html(md: str) -> str:
+    """Best-effort markdown→HTML; won’t crash if markdown2 isn’t installed."""
+    try:
+        import markdown2
+        return markdown2.markdown(md or "", extras=["fenced-code-blocks", "tables"])
+    except Exception:
+        return md or ""
 
+def _parse_dt_safe(v):
+    if not v:
+        return None
+    try:
+        dt = dateparser.parse(str(v))
+        if dt and not timezone.is_aware(dt):
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+        return dt
+    except Exception:
+        return None
 # ---------- Basic serializers ----------
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -323,12 +353,33 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             f.required = False
 
     def validate(self, attrs):
-        attrs["price_inr"] = _to_decimal(attrs.get("price_inr"), default="0.00")
-        attrs["gst_rate"] = _to_decimal(attrs.get("gst_rate"), allow_none=True)
-        attrs["mrp_price"] = _to_decimal(attrs.get("mrp_price"), allow_none=True)
+        # keep your existing numeric parsing
+        attrs["price_inr"]  = _to_decimal(attrs.get("price_inr"), default="0.00")
+        attrs["gst_rate"]   = _to_decimal(attrs.get("gst_rate"), allow_none=True)
+        attrs["mrp_price"]  = _to_decimal(attrs.get("mrp_price"), allow_none=True)
         attrs["cost_price"] = _to_decimal(attrs.get("cost_price"), allow_none=True)
         dpk = attrs.get("default_pack_qty")
         attrs["default_pack_qty"] = _to_decimal(dpk, allow_none=True)
+
+        errors = {}
+
+        name = (attrs.get("name") or "").strip()
+        if not name:
+            errors["name"] = "Product name is required"
+
+        # category is required (explicit field error key matches frontend)
+        if not attrs.get("category"):
+            errors["category_id"] = "Category is required"
+
+        try:
+            pinr = Decimal(str(attrs.get("price_inr") or "0"))
+        except Exception:
+            pinr = Decimal("0")
+        if pinr <= 0:
+            errors["price_inr"] = "Price must be greater than 0"
+
+        if errors:
+            raise serializers.ValidationError(errors)
         return attrs
 
     def create(self, validated_data):
@@ -741,7 +792,7 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta:
         model  = Order
         fields = [
-            "id", "status", "payment_method",
+            "id", "status", "payment_method","shipment_status",
             "country_code", "currency",
             "created_at", "updated_at",
             "checkout_details", "payment",
@@ -930,10 +981,22 @@ class BlogPostVersionSerializer(serializers.ModelSerializer):
     def get_editor_name(self, obj):
         return (obj.editor.get_full_name() or obj.editor.email) if obj.editor else None
 
+class BlogPostVersionSerializer(serializers.ModelSerializer):
+    editor_name = serializers.SerializerMethodField()
+    class Meta:
+        model = BlogPostVersion
+        fields = [
+            "version","title","excerpt","content_markdown","content_html",
+            "tags_csv","editor","editor_name","created_at"
+        ]
+    def get_editor_name(self, obj):
+        return _user_display_name(getattr(obj, "editor", None))
 
 class BlogPostSerializer(serializers.ModelSerializer):
     category = BlogCategorySerializer(read_only=True)
-    category_id = serializers.PrimaryKeyRelatedField(source="category", queryset=BlogCategory.objects.all(), write_only=True)
+    category_id = serializers.PrimaryKeyRelatedField(
+        source="category", queryset=BlogCategory.objects.all(), write_only=True
+    )
     author_name = serializers.SerializerMethodField()
     tags = serializers.ListField(child=serializers.CharField(), required=False)
     cover_url = serializers.SerializerMethodField()
@@ -953,22 +1016,22 @@ class BlogPostSerializer(serializers.ModelSerializer):
             "created_at", "updated_at",
             "versions",
         ]
-        read_only_fields = ["author", "author_name", "slug", "created_at", "updated_at", "views_count", "tags_csv"]
+        read_only_fields = [
+            "author", "author_name", "slug",
+            "created_at", "updated_at", "views_count", "tags_csv"
+        ]
+    
 
     def get_author_name(self, obj):
-        u = obj.author
-        return (u.get_full_name() or u.email.split("@")[0]) if u else None
+        return _user_display_name(getattr(obj, "author", None))
 
     def get_cover_url(self, obj):
         request = self.context.get("request")
         if obj.cover and hasattr(obj.cover, "url"):
-            if request:
-                return request.build_absolute_uri(obj.cover.url)
-            return obj.cover.url
+            return request.build_absolute_uri(obj.cover.url) if request else obj.cover.url
         return None
 
     def to_internal_value(self, data):
-        # Accept either tags[] or comma-separated tags_csv
         ret = super().to_internal_value(data)
         tags_list = data.get("tags")
         if tags_list is None:
@@ -995,7 +1058,10 @@ class BlogPostSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         user = getattr(request, "user", None)
         tags = validated.pop("tags", [])
-        post = BlogPost.objects.create(author=user if user and user.is_authenticated else None, **validated)
+        post = BlogPost.objects.create(
+            author=user if user and user.is_authenticated else None,
+            **validated
+        )
         post.set_tags(tags or [])
         post.save()
         self._snapshot_version(post, user)
