@@ -145,14 +145,24 @@ def _render_order_email_parts(order, request, heading_for_customer=True):
         parts = [
             getattr(det, "address1", "") or "",
             getattr(det, "address2", "") or "",
-            ", ".join([x for x in [getattr(det, "city", ""), getattr(det, "state", ""), getattr(det, "postcode", "")] if x]),
+            ", ".join(
+                [
+                    x
+                    for x in [
+                        getattr(det, "city", ""),
+                        getattr(det, "state", ""),
+                        getattr(det, "postcode", ""),
+                    ]
+                    if x
+                ]
+            ),
             getattr(det, "country", "") or "",
         ]
         address = "\n".join([p for p in parts if p])
 
     subject = f"Order #{order.id} {'Placed' if heading_for_customer else 'Notification'}"
 
-    # Plain text  (FIXED)
+    # Plain text
     lines_text_list = []
     for l in lines:
         weight_str = f" ({l.get('weight')})" if l.get("weight") else ""
@@ -177,8 +187,10 @@ def _render_order_email_parts(order, request, heading_for_customer=True):
         f"{address}\n"
     )
 
-    # HTML (unchanged)
-    def esc(s): return escape(s or "")
+    # HTML
+    def esc(s):
+        return escape(s or "")
+
     rows = ""
     for l in lines:
         img_td = (
@@ -186,10 +198,10 @@ def _render_order_email_parts(order, request, heading_for_customer=True):
             'style="height:40px;width:40px;object-fit:cover;border-radius:6px;margin-right:8px" />'
         ) if l["image"] else ""
 
-        # ✅ build the optional weight snippet first (no backslashes in f-string expressions)
         weight_html = (
             f" <span style='color:#666;font-size:12px'>({esc(l['weight'])})</span>"
-            if l["weight"] else ""
+            if l["weight"]
+            else ""
         )
 
         rows += (
@@ -207,10 +219,22 @@ def _render_order_email_parts(order, request, heading_for_customer=True):
             'style="padding:12px;border:1px solid #eee;color:#666">No items</td></tr>'
         )
 
-
-    pay_provider = getattr(getattr(order, "payment", None), "provider", "") or getattr(order, "payment_method", "") or "-"
-    pay_status = getattr(getattr(order, "payment", None), "status", "") or ("paid" if order.status == "confirmed" else "unpaid")
+    pay_provider = (
+        getattr(getattr(order, "payment", None), "provider", "")
+        or getattr(order, "payment_method", "")
+        or "-"
+    )
+    pay_status = (
+        getattr(getattr(order, "payment", None), "status", "")
+        or ("paid" if order.status == "confirmed" else "unpaid")
+    )
     txn_id = getattr(getattr(order, "payment", None), "transaction_id", "") or ""
+    # NEW: pick up specific payment method (upi / card / netbanking / ...)
+    pay_method = (
+        getattr(getattr(order, "payment", None), "method", "")
+        or getattr(order, "payment_method", "")
+        or ""
+    )
 
     html = f"""
     <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;color:#111">
@@ -250,7 +274,8 @@ def _render_order_email_parts(order, request, heading_for_customer=True):
         </div>
         <div style="flex:1">
           <h3 style="margin:0 0 6px">Payment</h3>
-          <div>Method/Provider: <strong>{esc(pay_provider)}</strong></div>
+          <div>Provider: <strong>{esc(pay_provider)}</strong></div>
+          {('<div>Method: <strong>' + esc(pay_method) + '</strong></div>') if pay_method else ''}
           <div>Status: <strong style="text-transform:capitalize">{esc(pay_status)}</strong></div>
           {('<div>Txn ID: <span style="font-family:monospace">' + esc(txn_id) + '</span></div>') if txn_id else ''}
         </div>
@@ -262,6 +287,7 @@ def _render_order_email_parts(order, request, heading_for_customer=True):
     </div>
     """
     return subject, text, html
+
 
 
 def _send_email(subject, to_list, text_body, html_body=None, bcc=None):
@@ -1261,6 +1287,7 @@ class OrderViewSet(viewsets.ModelViewSet):
         return Response({"ok": True, "order": ser.data}, status=201)
 
     # ---------- Razorpay ----------
+     # ---------- Razorpay ----------
     @action(detail=False, methods=["post"], permission_classes=[permissions.AllowAny])
     @transaction.atomic
     def razorpay_confirm(self, request):
@@ -1270,38 +1297,86 @@ class OrderViewSet(viewsets.ModelViewSet):
         if not rp_order_id or not rp_payment_id:
             return Response({"detail": "razorpay_order_id and razorpay_payment_id required"}, status=400)
 
-        user = request.user if (request.user and request.user.is_authenticated) else self._get_or_create_guest_user(checkout)
+        user = (
+            request.user
+            if (request.user and request.user.is_authenticated)
+            else self._get_or_create_guest_user(checkout)
+        )
         cart = self._ensure_cart(user)
         client_lines = checkout.get("lines") or []
         self._upsert_cart_items_from_lines(cart, client_lines)
 
+        # --- create base order (status confirmed, shipment pending) ---
         order = Order.objects.create(
-            user=user, cart=cart, status="confirmed", shipment_status="pending",
-            payment_method="card", country_code="IN", currency="INR",
+            user=user,
+            cart=cart,
+            status="confirmed",
+            shipment_status="pending",
+            payment_method="card",  # provisional; will override with Razorpay method below
+            country_code="IN",
+            currency="INR",
         )
 
-        full_name = (f"{checkout.get('firstName','').strip()} {checkout.get('lastName','').strip()}".strip()
-                     or user.get_full_name() or user.email)
+        full_name = (
+            f"{checkout.get('firstName','').strip()} {checkout.get('lastName','').strip()}".strip()
+            or user.get_full_name()
+            or user.email
+        )
         OrderCheckoutDetails.objects.create(
             order=order,
             full_name=full_name,
-            email=checkout.get("email",""),
-            phone=checkout.get("phone",""),
-            address1=checkout.get("address",""),
-            address2=checkout.get("address2",""),
-            city=checkout.get("city",""),
-            state=checkout.get("state",""),
-            postcode=checkout.get("zipCode",""),
-            country=checkout.get("country","India") or "India",
+            email=checkout.get("email", ""),
+            phone=checkout.get("phone", ""),
+            address1=checkout.get("address", ""),
+            address2=checkout.get("address2", ""),
+            city=checkout.get("city", ""),
+            state=checkout.get("state", ""),
+            postcode=checkout.get("zipCode", ""),
+            country=checkout.get("country", "India") or "India",
             notes=(checkout.get("notes") or ""),
         )
 
+        # --- Fetch Razorpay payment to know METHOD (upi, card, netbanking...) + exact amount ---
+        payment_obj = None
+        payment_method = "card"
+        amount_dec = Decimal("0.00")
+
+        try:
+            client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+            payment_obj = client.payment.fetch(rp_payment_id)
+
+            # e.g. "upi", "card", "netbanking", "wallet", ...
+            payment_method = (payment_obj.get("method") or "card").lower()
+
+            # Razorpay sends amount in paise -> convert to rupees
+            amt_paise = Decimal(str(payment_obj.get("amount") or "0"))
+            amount_dec = (amt_paise / Decimal("100")).quantize(Decimal("0.01"))
+        except Exception:
+            # Fallback: use amount from request if provided
+            try:
+                amount_dec = Decimal(str(request.data.get("amount") or 0))
+            except Exception:
+                amount_dec = Decimal("0.00")
+
+        # Update order with the actual Razorpay method (upi/card/netbanking/etc.)
+        order.payment_method = payment_method
+        order.save(update_fields=["payment_method"])
+
         OrderPayment.objects.create(
-            order=order, method="card", provider="razorpay", status="paid",
-            transaction_id=rp_payment_id, currency="INR",
-            amount=Decimal(str(request.data.get("amount") or 0)),
-            raw={"razorpay_order_id": rp_order_id, "razorpay_payment_id": rp_payment_id,
-                 "lines": client_lines, "totals": checkout.get("totals") or {}},
+            order=order,
+            method=payment_method,             # <- upi / card / netbanking / ...
+            provider="razorpay",
+            status="paid",
+            transaction_id=rp_payment_id,
+            currency="INR",
+            amount=amount_dec,
+            raw={
+                "razorpay_order_id": rp_order_id,
+                "razorpay_payment_id": rp_payment_id,
+                "razorpay_payment": payment_obj,   # full Razorpay payment payload for debugging
+                "lines": client_lines,
+                "totals": checkout.get("totals") or {},
+            },
         )
 
         cart.checked_out = True
